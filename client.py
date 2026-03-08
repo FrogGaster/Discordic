@@ -7,7 +7,10 @@ import websockets
 import customtkinter as ctk
 from dotenv import load_dotenv
 
-# Исправление для Python 3.13 (audioop удален)
+# Импортируем исключения для обработки Бана (403) и Кика (1008)
+from websockets.exceptions import InvalidStatusCode, ConnectionClosed
+
+# === 1. АУДИО МОДУЛЬ ===
 try:
     import audioop
 except ImportError:
@@ -15,47 +18,60 @@ except ImportError:
         import audioop_lts as audioop
     except ImportError:
         audioop = None
+        print("Warning: audioop not found. Volume control disabled.")
 
-# === КОНСТАНТЫ ===
+# === 2. КОНФИГУРАЦИЯ ===
 load_dotenv()
-SERVER_HOST = os.getenv("SERVER_HOST", "127.0.0.1")
-SERVER_PORT = int(os.getenv("SERVER_PORT", 8000))
-WS_BASE_URL = f"ws://{SERVER_HOST}:{SERVER_PORT}/ws"
-API_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
-CHUNK, RATE = 1024, 44100
-FORMAT, CHANNELS = pyaudio.paInt16, 1
+SERVER_IP = "127.0.0.1"
+SERVER_PORT = "8000"
+API_URL = f"http://{SERVER_IP}:{SERVER_PORT}"
+WS_BASE_URL = f"ws://{SERVER_IP}:{SERVER_PORT}/ws"
+
+# Настройки PyAudio
+CHUNK = 1024
+RATE = 44100
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
+# === 3. КЛАСС РАБОТЫ СО ЗВУКОМ ===
 class AudioHandler:
     def __init__(self):
         self.p = pyaudio.PyAudio()
         self.in_s = self.out_s = None
         self.active = False
-        self.volume = 1.0
+        self.global_vol = 1.0  # Общая громкость
         self.muted = False
 
-    def start(self, send_cb):
+    def start(self, callback):
         self.stop()
         self.active = True
         try:
             self.out_s = self.p.open(format=FORMAT, channels=CHANNELS, rate=RATE, output=True)
             self.in_s = self.p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
+            
             def record_loop():
                 while self.active:
                     try:
                         data = self.in_s.read(CHUNK, exception_on_overflow=False)
-                        if not self.muted: send_cb(data)
+                        if not self.muted:
+                            callback(data)
                     except: break
             threading.Thread(target=record_loop, daemon=True).start()
-        except: pass
+        except Exception as e:
+            print(f"Audio Start Error: {e}")
 
-    def play(self, data):
+    def play(self, data, vol=1.0):
         if self.out_s and self.active:
-            if self.volume != 1.0 and audioop:
-                data = audioop.mul(data, 2, self.volume)
+            final_vol = self.global_vol * vol
+            
+            if final_vol != 1.0 and audioop:
+                try: data = audioop.mul(data, 2, final_vol)
+                except: pass
+            
             try: self.out_s.write(data)
             except: pass
 
@@ -64,212 +80,299 @@ class AudioHandler:
         if self.in_s: self.in_s.stop_stream(); self.in_s.close(); self.in_s = None
         if self.out_s: self.out_s.stop_stream(); self.out_s.close(); self.out_s = None
 
+# === 4. ОКНО АДМИНА ===
+class AdminWindow(ctk.CTkToplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("ADMIN PANEL")
+        self.geometry("300x350")
+        self.app = parent
+        self.attributes("-topmost", True)
+        
+        ctk.CTkLabel(self, text="УПРАВЛЕНИЕ", font=("Arial", 16, "bold"), text_color="red").pack(pady=10)
+        
+        self.target = ctk.CTkEntry(self, placeholder_text="Nick to Ban/Mute")
+        self.target.pack(pady=5, padx=20, fill="x")
+        
+        self.info = ctk.CTkLabel(self, text="")
+        self.info.pack(pady=5)
+
+        ctk.CTkButton(self, text="BAN / UNBAN", fg_color="#800", hover_color="#A00", 
+                      command=lambda: self.act("ban")).pack(pady=10, padx=20, fill="x")
+        
+        ctk.CTkButton(self, text="MUTE / UNMUTE", fg_color="#880", hover_color="#AA0", text_color="black",
+                      command=lambda: self.act("mute")).pack(pady=5, padx=20, fill="x")
+
+    def act(self, action):
+        t = self.target.get().strip()
+        if not t: return self.info.configure(text="Введите ник!", text_color="yellow")
+        
+        try:
+            r = requests.post(f"{API_URL}/admin/{action}", json={
+                "target_username": t, "admin_password": self.app.password
+            })
+            if r.status_code == 200:
+                self.info.configure(text=f"Success: {r.json().get('new_state')}", text_color="green")
+            else:
+                self.info.configure(text=f"Error: {r.json().get('detail')}", text_color="red")
+        except:
+            self.info.configure(text="Network Error", text_color="red")
+
+# === 5. ОКНО НАСТРОЕК ===
 class SettingsWindow(ctk.CTkToplevel):
     def __init__(self, parent):
         super().__init__(parent)
-        self.title("Настройки")
-        self.geometry("450x400")
+        self.title("Settings")
+        self.geometry("350x400")
         self.app = parent
         self.attributes("-topmost", True)
 
-        self.tabview = ctk.CTkTabview(self)
-        self.tabview.pack(fill="both", expand=True, padx=10, pady=10)
-        self.tabview.add("Профиль")
-        self.tabview.add("Голос")
+        self.tab = ctk.CTkTabview(self)
+        self.tab.pack(fill="both", expand=True, padx=10, pady=10)
+        self.tab.add("Profile"); self.tab.add("Audio")
 
-        # Профиль
-        ctk.CTkLabel(self.tabview.tab("Профиль"), text="Статус:").pack(pady=(10,0))
-        self.st_e = ctk.CTkEntry(self.tabview.tab("Профиль"), width=300)
-        self.st_e.pack(pady=5)
-        ctk.CTkLabel(self.tabview.tab("Профиль"), text="О себе:").pack(pady=(10,0))
-        self.bio_e = ctk.CTkEntry(self.tabview.tab("Профиль"), width=300)
-        self.bio_e.pack(pady=5)
-        ctk.CTkButton(self.tabview.tab("Профиль"), text="Сохранить", command=self.save_p).pack(pady=20)
+        # Profile
+        ctk.CTkLabel(self.tab.tab("Profile"), text="Status").pack()
+        self.st = ctk.CTkEntry(self.tab.tab("Profile")); self.st.pack(pady=5)
+        ctk.CTkLabel(self.tab.tab("Profile"), text="Bio").pack()
+        self.bio = ctk.CTkEntry(self.tab.tab("Profile")); self.bio.pack(pady=5)
+        ctk.CTkButton(self.tab.tab("Profile"), text="Save", command=self.save).pack(pady=10)
 
-        # Голос
-        ctk.CTkLabel(self.tabview.tab("Голос"), text="Громкость динамиков:").pack(pady=(10,0))
-        self.vol_slider = ctk.CTkSlider(self.tabview.tab("Голос"), from_=0, to=2, command=self.set_v)
-        self.vol_slider.set(self.app.audio.volume)
-        self.vol_slider.pack(pady=5)
-        self.mute_sw = ctk.CTkSwitch(self.tabview.tab("Голос"), text="Выключить микрофон", command=self.set_m)
-        if self.app.audio.muted: self.mute_sw.select()
-        self.mute_sw.pack(pady=20)
-        self.load_p()
+        # Audio
+        ctk.CTkLabel(self.tab.tab("Audio"), text="Global Volume").pack()
+        self.sl = ctk.CTkSlider(self.tab.tab("Audio"), from_=0, to=2, command=self.set_vol)
+        self.sl.set(self.app.audio.global_vol); self.sl.pack(pady=5)
+        self.sw = ctk.CTkSwitch(self.tab.tab("Audio"), text="Mute Mic", command=self.set_mute)
+        if self.app.audio.muted: self.sw.select()
+        self.sw.pack(pady=20)
+        
+        self.load()
 
-    def set_v(self, v): self.app.audio.volume = float(v)
-    def set_m(self): self.app.audio.muted = self.mute_sw.get() == 1
-    def load_p(self):
+    def set_vol(self, v): self.app.audio.global_vol = float(v)
+    def set_mute(self): self.app.audio.muted = (self.sw.get() == 1)
+    
+    def load(self):
         try:
             r = requests.get(f"{API_URL}/profile/{self.app.username}").json()
-            self.st_e.insert(0, r.get("status", ""))
-            self.bio_e.insert(0, r.get("bio", ""))
+            self.st.insert(0, r.get("status","")); self.bio.insert(0, r.get("bio",""))
         except: pass
-    def save_p(self):
-        p = {"username": self.app.username, "status": self.st_e.get(), "bio": self.bio_e.get()}
-        requests.post(f"{API_URL}/profile/update", json=p)
-        self.destroy()
 
+    def save(self):
+        try: requests.post(f"{API_URL}/profile/update", json={"username": self.app.username, "status": self.st.get(), "bio": self.bio.get()}); self.destroy()
+        except: pass
+
+# === 6. ГЛАВНОЕ ПРИЛОЖЕНИЕ ===
 class DiscordApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("PyDiscord")
-        self.geometry("1100x750")
+        self.title("PyDiscord v2")
+        self.geometry("1100x700")
 
+        # Данные
         self.username = ""
-        self.current_txt_ch = "general"
-        self.current_voice_ch = None
+        self.password = ""
+        self.is_admin = False
+        
+        # Состояние
+        self.curr_txt = "general"
+        self.curr_voice = None
         self.txt_ws = None
         self.voice_ws = None
+        self.user_vols = {}
+
         self.loop = asyncio.new_event_loop()
         self.audio = AudioHandler()
 
-        # ЭКРАН ЛОГИНА
-        self.login_f = ctk.CTkFrame(self)
-        self.login_f.place(relx=0.5, rely=0.5, anchor="center")
-        ctk.CTkLabel(self.login_f, text="PyDiscord Login", font=("Arial", 20, "bold")).pack(pady=20, padx=30)
-        self.u_e = ctk.CTkEntry(self.login_f, placeholder_text="Никнейм", width=250)
-        self.u_e.pack(pady=5)
-        self.p_e = ctk.CTkEntry(self.login_f, placeholder_text="Пароль", show="*", width=250)
-        self.p_e.pack(pady=5)
-        ctk.CTkButton(self.login_f, text="Войти", command=self.login_process).pack(pady=20)
+        # --- ЭКРАН ВХОДА ---
+        self.log_fr = ctk.CTkFrame(self)
+        self.log_fr.place(relx=0.5, rely=0.5, anchor="center")
+        
+        ctk.CTkLabel(self.log_fr, text="PyDiscord Login", font=("Arial", 20, "bold")).pack(pady=20, padx=40)
+        self.err = ctk.CTkLabel(self.log_fr, text="", text_color="red")
+        self.err.pack()
+        
+        self.u_e = ctk.CTkEntry(self.log_fr, placeholder_text="Username"); self.u_e.pack(pady=5)
+        self.p_e = ctk.CTkEntry(self.log_fr, placeholder_text="Password", show="*"); self.p_e.pack(pady=5)
+        
+        bf = ctk.CTkFrame(self.log_fr, fg_color="transparent"); bf.pack(pady=20)
+        ctk.CTkButton(bf, text="Login", width=90, command=self.login).pack(side="left", padx=5)
+        ctk.CTkButton(bf, text="Register", width=90, fg_color="#444", command=self.reg).pack(side="right", padx=5)
 
-        # ГЛАВНЫЙ ИНТЕРФЕЙС
-        self.main_f = ctk.CTkFrame(self)
-        self.sidebar = ctk.CTkFrame(self.main_f, width=220, corner_radius=0)
+        # --- ОСНОВНОЙ ЭКРАН (Инит, но не показ) ---
+        self.main_fr = ctk.CTkFrame(self)
+        
+        # Сайдбар
+        self.sidebar = ctk.CTkFrame(self.main_fr, width=220, corner_radius=0)
         self.sidebar.pack(side="left", fill="y")
         
-        ctk.CTkLabel(self.sidebar, text="ТЕКСТОВЫЕ КАНАЛЫ", text_color="gray", font=("Arial", 10, "bold")).pack(pady=(15, 5))
-        for n, cid in [("# болталка", "general"), ("# оффтоп", "offtopic")]:
-            ctk.CTkButton(self.sidebar, text=n, anchor="w", fg_color="transparent", command=lambda c=cid: self.switch_txt(c)).pack(fill="x", padx=10)
+        # Текстовые каналы
+        ctk.CTkLabel(self.sidebar, text="TEXT", text_color="gray", font=("Arial", 10, "bold")).pack(pady=(15,5))
+        for c in ["general", "dev", "offtopic"]:
+            ctk.CTkButton(self.sidebar, text=f"# {c}", fg_color="transparent", anchor="w", command=lambda x=c: self.sw_txt(x)).pack(fill="x", padx=10)
+        
+        # Голосовые каналы
+        ctk.CTkLabel(self.sidebar, text="VOICE", text_color="gray", font=("Arial", 10, "bold")).pack(pady=(20,5))
+        for c in ["voice1", "voice2"]:
+            ctk.CTkButton(self.sidebar, text=f"🔊 {c}", fg_color="#333", anchor="w", command=lambda x=c: self.join_v(x)).pack(fill="x", padx=10, pady=2)
+            
+        # Кнопка Админа (скрыта)
+        self.admin_btn = ctk.CTkButton(self.sidebar, text="⚠️ ADMIN PANEL", fg_color="#900", hover_color="#B00", command=lambda: AdminWindow(self))
+        
+        # Панель юзера
+        self.u_pan = ctk.CTkFrame(self.sidebar, fg_color="#222")
+        self.u_pan.pack(side="bottom", fill="x", padx=5, pady=5)
+        self.v_lbl = ctk.CTkLabel(self.u_pan, text="Voice: Off", text_color="gray")
+        self.v_lbl.pack()
+        bpf = ctk.CTkFrame(self.u_pan, fg_color="transparent"); bpf.pack(fill="x")
+        ctk.CTkButton(bpf, text="⚙", width=30, command=lambda: SettingsWindow(self)).pack(side="left", padx=5, pady=5)
+        self.lv_btn = ctk.CTkButton(bpf, text="Exit", width=60, fg_color="#833", command=self.leave_v)
 
-        ctk.CTkLabel(self.sidebar, text="ГОЛОСОВЫЕ КАНАЛЫ", text_color="gray", font=("Arial", 10, "bold")).pack(pady=(20, 5))
-        for n, cid in [("🔊 Голос 1", "voice1"), ("🔊 Голос 2", "voice2")]:
-            ctk.CTkButton(self.sidebar, text=n, anchor="w", fg_color="#333", command=lambda c=cid: self.join_voice(c)).pack(fill="x", padx=10, pady=2)
+        # Чат зона
+        self.chat = ctk.CTkFrame(self.main_fr, fg_color="#1e1e1e"); self.chat.pack(side="right", fill="both", expand=True)
+        self.head = ctk.CTkLabel(self.chat, text="# general", font=("Arial", 16, "bold")); self.head.pack(pady=10)
+        
+        # Список участников голоса
+        self.v_lst_fr = ctk.CTkFrame(self.chat, height=0, fg_color="#2b2b2b")
+        self.v_lst = ctk.CTkFrame(self.v_lst_fr, fg_color="transparent"); self.v_lst.pack(pady=5)
+        
+        # Скролл чата
+        self.scr = ctk.CTkScrollableFrame(self.chat, fg_color="transparent"); self.scr.pack(fill="both", expand=True, padx=10)
+        
+        # Ввод
+        inp = ctk.CTkFrame(self.chat, fg_color="transparent"); inp.pack(fill="x", padx=10, pady=10)
+        self.msg_e = ctk.CTkEntry(inp, placeholder_text="Message..."); self.msg_e.pack(side="left", fill="x", expand=True)
+        self.msg_e.bind("<Return>", lambda e: self.send()); ctk.CTkButton(inp, text=">", width=40, command=self.send).pack(side="right", padx=5)
 
-        self.user_p = ctk.CTkFrame(self.sidebar, fg_color="#222")
-        self.user_p.pack(side="bottom", fill="x", padx=5, pady=5)
-        self.v_lbl = ctk.CTkLabel(self.user_p, text="Голос: нет", text_color="gray", font=("Arial", 11))
-        self.v_lbl.pack(pady=2)
-        btns_f = ctk.CTkFrame(self.user_p, fg_color="transparent")
-        btns_f.pack(fill="x")
-        ctk.CTkButton(btns_f, text="⚙", width=35, command=lambda: SettingsWindow(self)).pack(side="left", padx=5, pady=5)
-        self.v_disc_btn = ctk.CTkButton(btns_f, text="Выйти", fg_color="#633", width=80, height=25, command=self.leave_voice)
-
-        # ЧАТ
-        self.chat_area = ctk.CTkFrame(self.main_f, fg_color="#1e1e1e", corner_radius=0)
-        self.chat_area.pack(side="right", fill="both", expand=True)
-        self.header = ctk.CTkLabel(self.chat_area, text="# general", font=("Arial", 16, "bold"))
-        self.header.pack(pady=10)
-
-        # Панель участников (создаем, но не пакуем)
-        self.m_frame = ctk.CTkFrame(self.chat_area, fg_color="#252525", height=45)
-        self.m_list_f = ctk.CTkFrame(self.m_frame, fg_color="transparent")
-        self.m_list_f.pack(pady=5)
-
-        self.scroll = ctk.CTkScrollableFrame(self.chat_area, fg_color="transparent")
-        self.scroll.pack(fill="both", expand=True, padx=10)
-
-        self.in_f = ctk.CTkFrame(self.chat_area, fg_color="transparent")
-        self.in_f.pack(fill="x", padx=10, pady=10)
-        self.msg_e = ctk.CTkEntry(self.in_f, placeholder_text="Написать сообщение...")
-        self.msg_e.pack(side="left", fill="x", expand=True)
-        self.msg_e.bind("<Return>", lambda e: self.send_txt())
-        ctk.CTkButton(self.in_f, text="Send", width=60, command=self.send_txt).pack(side="right", padx=5)
-
-    def login_process(self):
-        self.username, pwd = self.u_e.get(), self.p_e.get()
-        if not self.username or not pwd: return
+    # === ЛОГИКА ===
+    def login(self):
+        u, p = self.u_e.get(), self.p_e.get()
         try:
-            res = requests.post(f"{API_URL}/login", json={"username":self.username, "password":pwd})
-            if res.status_code == 200:
-                self.login_f.destroy(); self.main_f.pack(fill="both", expand=True)
-                threading.Thread(target=self.start_async, daemon=True).start()
-        except: pass
+            r = requests.post(f"{API_URL}/login", json={"username":u, "password":p})
+            d = r.json()
+            if r.status_code == 200:
+                self.username = u; self.password = p; self.is_admin = d.get("is_admin", False)
+                self.log_fr.destroy(); self.main_fr.pack(fill="both", expand=True)
+                if self.is_admin: self.admin_btn.pack(side="bottom", fill="x", padx=10, pady=10)
+                threading.Thread(target=self.run_async, daemon=True).start()
+            else: self.err.configure(text=d.get("detail"))
+        except: self.err.configure(text="Server Offline")
 
-    def start_async(self):
+    def reg(self):
+        try:
+            r = requests.post(f"{API_URL}/register", json={"username":self.u_e.get(), "password":self.p_e.get()})
+            if r.status_code == 200: self.err.configure(text="Registered! Log in.", text_color="green")
+            else: self.err.configure(text=r.json().get("detail"))
+        except: self.err.configure(text="Server Offline")
+
+    # === СЕТЬ ===
+    def run_async(self):
         asyncio.set_event_loop(self.loop)
-        self.loop.create_task(self.net_text_loop())
-        self.loop.create_task(self.net_voice_loop())
+        self.loop.create_task(self.txt_loop())
+        self.loop.create_task(self.voice_loop())
         self.loop.run_forever()
 
-    async def net_text_loop(self):
+    async def txt_loop(self):
         while True:
-            self.load_history(self.current_txt_ch)
+            self.load_hist(self.curr_txt)
             try:
-                async with websockets.connect(f"{WS_BASE_URL}/{self.current_txt_ch}/{self.username}") as ws:
+                uri = f"{WS_BASE_URL}/{self.curr_txt}/{self.username}"
+                async with websockets.connect(uri) as ws:
                     self.txt_ws = ws
                     while True:
                         msg = await ws.recv()
-                        if not msg.startswith("MEMBERS:"): self.add_ui(msg)
-            except: self.txt_ws = None; await asyncio.sleep(1)
+                        if not msg.startswith("MEMBERS:"): self.add_msg(msg)
+            
+            # Если 403 (БАН) или 1008 (КИК) - пишем и реконнектимся реже
+            except InvalidStatusCode as e:
+                if e.status_code == 403: self.add_msg("🔴 SYSTEM: YOU ARE BANNED.")
+                self.txt_ws = None; await asyncio.sleep(10)
+            except ConnectionClosed as e:
+                self.txt_ws = None; await asyncio.sleep(2)
+            except Exception:
+                self.txt_ws = None; await asyncio.sleep(2)
 
-    async def net_voice_loop(self):
+    async def voice_loop(self):
         while True:
-            if not self.current_voice_ch: await asyncio.sleep(0.2); continue
+            # Если канал не выбран - просто ждем
+            if not self.curr_voice: await asyncio.sleep(0.5); continue
+            
             try:
-                async with websockets.connect(f"{WS_BASE_URL}/{self.current_voice_ch}/{self.username}") as ws:
+                uri = f"{WS_BASE_URL}/{self.curr_voice}/{self.username}"
+                async with websockets.connect(uri) as ws:
                     self.voice_ws = ws
-                    self.v_lbl.configure(text=f"Голос: {self.current_voice_ch}", text_color="green")
-                    self.v_disc_btn.pack(side="right", padx=5)
-                    self.audio.start(lambda d: self.loop.call_soon_threadsafe(lambda: asyncio.create_task(ws.send(d))))
-                    while self.current_voice_ch:
+                    # Успешное подключение - обновляем UI
+                    self.v_lbl.configure(text=f"Voice: {self.curr_voice}", text_color="green")
+                    self.lv_btn.pack(side="right", padx=5)
+                    self.v_lst_fr.pack(fill="x", padx=10, pady=5)
+                    
+                    # Запуск отправки аудио
+                    async def safe_send(d):
+                        try: await ws.send(d)
+                        except: pass
+                    self.audio.start(lambda d: self.loop.call_soon_threadsafe(lambda: asyncio.create_task(safe_send(d))))
+                    
+                    # Цикл приема
+                    while self.curr_voice:
                         msg = await ws.recv()
-                        if isinstance(msg, bytes): self.audio.play(msg)
-                        elif msg.startswith("MEMBERS:"): self.upd_members(msg[8:].split(","))
-            except: pass
+                        if isinstance(msg, bytes):
+                            try:
+                                nl = msg[0]; sender = msg[1:1+nl].decode()
+                                self.audio.play(msg[1+nl:], self.user_vols.get(sender, 1.0))
+                            except: pass
+                        elif isinstance(msg, str) and msg.startswith("MEMBERS:"):
+                            self.upd_mems(msg[8:].split(","))
+
+            # === ОБРАБОТКА ОШИБОК ПОДКЛЮЧЕНИЯ ===
+            except InvalidStatusCode as e:
+                if e.status_code == 403: # Бан
+                    self.curr_voice = None # СБРАСЫВАЕМ КАНАЛ, ЧТОБЫ ПРЕКРАТИТЬ ДОЛБИТЬСЯ
+                    self.v_lbl.configure(text="BANNED", text_color="red")
+            
+            except ConnectionClosed as e:
+                if e.code == 1008: # Кик
+                    self.curr_voice = None # СБРАСЫВАЕМ КАНАЛ
+                    self.v_lbl.configure(text="KICKED", text_color="red")
+            
+            except Exception as e:
+                print(f"Voice err: {e}")
+            
             finally:
                 self.voice_ws = None; self.audio.stop()
-                self.v_lbl.configure(text="Голос: нет", text_color="gray")
-                self.v_disc_btn.pack_forget()
-                self.upd_members([]); await asyncio.sleep(1)
+                if self.curr_voice: # Если мы не сами нажали выход
+                     self.v_lbl.configure(text="Off", text_color="gray")
+                self.lv_btn.pack_forget(); self.v_lst_fr.pack_forget()
+                self.upd_mems([])
+                await asyncio.sleep(1)
 
-    def load_history(self, cid):
-        for w in self.scroll.winfo_children(): w.destroy()
+    # === UI HELPER ===
+    def load_hist(self, c):
+        for w in self.scr.winfo_children(): w.destroy()
         try:
-            h = requests.get(f"{API_URL}/history/{cid}").json()
-            for m in h: self.add_ui(f"{m['username']}: {m['content']}")
+            r = requests.get(f"{API_URL}/history/{c}").json()
+            for m in r: self.add_msg(f"{m['username']}: {m['content']}")
         except: pass
 
-    def switch_txt(self, cid):
-        self.current_txt_ch = cid
-        self.header.configure(text=f"# {cid}")
-        if self.txt_ws: asyncio.run_coroutine_threadsafe(self.txt_ws.close(), self.loop)
+    def sw_txt(self, c): self.curr_txt = c; self.head.configure(text=f"# {c}")
+    def add_msg(self, t): self.scr.after(0, lambda: ctk.CTkLabel(self.scr, text=t, anchor="w", justify="left", wraplength=600).pack(fill="x", pady=2))
+    def send(self):
+        if self.txt_ws: asyncio.run_coroutine_threadsafe(self.txt_ws.send(self.msg_e.get()), self.loop); self.msg_e.delete(0, "end")
+    
+    def join_v(self, c): self.curr_voice = c
+    def leave_v(self): self.curr_voice = None
 
-    def join_voice(self, cid):
-        """Исправленный метод: переупаковка для соблюдения порядка"""
-        if self.current_voice_ch == cid: return
-        self.current_voice_ch = cid
-        
-        # Переупаковываем элементы чата, чтобы вставить панель участников сверху
-        self.scroll.pack_forget()
-        self.in_f.pack_forget()
-        self.m_frame.pack(fill="x", padx=10, pady=5)
-        self.scroll.pack(fill="both", expand=True, padx=10)
-        self.in_f.pack(fill="x", padx=10, pady=10)
-        
-        if self.voice_ws: asyncio.run_coroutine_threadsafe(self.voice_ws.close(), self.loop)
-
-    def leave_voice(self):
-        self.current_voice_ch = None
-        self.m_frame.pack_forget()
-        if self.voice_ws: asyncio.run_coroutine_threadsafe(self.voice_ws.close(), self.loop)
-
-    def upd_members(self, users):
-        self.m_list_f.after(0, lambda: self._render_members(users))
-
-    def _render_members(self, users):
-        for w in self.m_list_f.winfo_children(): w.destroy()
-        for u in users:
-            if u: ctk.CTkLabel(self.m_list_f, text=f"🎙 {u}", fg_color="#333", corner_radius=6, padx=10).pack(side="left", padx=3)
-
-    def send_txt(self):
-        t = self.msg_e.get()
-        if t and self.txt_ws:
-            asyncio.run_coroutine_threadsafe(self.txt_ws.send(t), self.loop)
-            self.msg_e.delete(0, 'end')
-
-    def add_ui(self, m):
-        self.scroll.after(0, lambda: ctk.CTkLabel(self.scroll, text=m, wraplength=800, justify="left", anchor="w").pack(fill="x"))
+    def upd_mems(self, m): self.v_lst.after(0, lambda: self._dr_m(m))
+    def _dr_m(self, m):
+        for w in self.v_lst.winfo_children(): w.destroy()
+        for u in m:
+            if not u: continue
+            f = ctk.CTkFrame(self.v_lst, fg_color="#3B3B3B"); f.pack(side="left", padx=5)
+            ctk.CTkLabel(f, text=f"🎙 {u}", font=("Arial",12,"bold")).pack(padx=10, pady=(5,0))
+            if u != self.username:
+                s = ctk.CTkSlider(f, from_=0, to=3, width=80, height=15)
+                s.set(self.user_vols.get(u, 1.0)); s.pack(padx=10, pady=5)
+                s.configure(command=lambda v, usr=u: self.user_vols.update({usr:v}))
+            else: ctk.CTkLabel(f, text="(You)", text_color="gray").pack()
 
 if __name__ == "__main__":
-    DiscordApp().mainloop()
+    app = DiscordApp()
+    app.mainloop()
